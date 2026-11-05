@@ -141,6 +141,8 @@ struct RecvState {
 // well under the limit so header+payload never reaches the exact-65536 boundary that the
 // receiver's reassembly would truncate with data loss.
 const MAX_FRAGMENT_PAYLOAD: usize = 60000;
+// How often `flush` looks whether the peer acknowledged everything sent.
+const FLUSH_POLL: Duration = Duration::from_millis(10);
 /// Receive scratch size: must be >= 1 (fragment header) + `MAX_FRAGMENT_PAYLOAD` and fit the
 /// negotiated SCTP max message size.
 const RECV_BUF_SIZE: usize = 64 * 1024;
@@ -1166,6 +1168,62 @@ impl WebRTCStream {
     #[inline]
     pub fn close_detached(&self) {
         self.close_detached_with(());
+    }
+
+    /// Waits, `within` at most, until everything sent is acknowledged by the peer, or the peer
+    /// closed (nothing more is acknowledged then): `send` only queues into SCTP, and the pc closing
+    /// right after (the stream dropped) resets the channel at once, what is still queued never
+    /// sent. What comes in meanwhile is dropped, the session being over. For the side answering a
+    /// close; the side closing `linger`s.
+    pub async fn flush(&mut self, within: Duration) {
+        self.wait_out(within, false).await
+    }
+
+    /// Waits, `within` at most, for the peer to close: the one sign it read a parting message (a
+    /// close reason, a login error) sent last. Acknowledged is only in its SCTP stack, and the
+    /// reset the drop sends makes it throw away what it has not read yet (`read_sctp` looks for a
+    /// reset first), which a peer busy elsewhere (a send of its own blocked, say) may not have.
+    /// What comes in meanwhile is dropped.
+    pub async fn linger(&mut self, within: Duration) {
+        self.wait_out(within, true).await
+    }
+
+    async fn wait_out(&mut self, within: Duration, until_closed: bool) {
+        let deadline = Instant::now() + within;
+        if !matches!(*self.state_notify.borrow(), WebRTCConnectionState::Open) {
+            return;
+        }
+        // Never detached, nothing was ever sent.
+        let dc = self.detached.lock().await.clone();
+        loop {
+            let acked = dc.as_ref().map_or(true, |dc| dc.buffered_amount() == 0);
+            if acked && !until_closed {
+                return;
+            }
+            // Looked at on every round, not only when nothing came in: a peer with more to read
+            // than it takes to read it would otherwise keep this past its bound.
+            let now = Instant::now();
+            if now >= deadline {
+                log::debug!(
+                    "WebRTC {} gave up, {} bytes not acknowledged",
+                    if until_closed { "linger" } else { "flush" },
+                    dc.as_ref().map_or(0, |dc| dc.buffered_amount())
+                );
+                return;
+            }
+            // Looked at again now and then while not all acknowledged; `next` keeps a message it
+            // was cancelled in the middle of.
+            let until = if acked {
+                deadline
+            } else {
+                deadline.min(now + FLUSH_POLL)
+            };
+            match timeout_at(until, self.next()).await {
+                Ok(Some(Ok(_))) | Err(_) => {}
+                // Closed by the peer, or gone.
+                Ok(_) => return,
+            }
+        }
     }
 
     /// Close a pc no caller ever took. Spawned on `WEBRTC_RT` like `close_detached`, but the
@@ -2510,6 +2568,155 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // A client session runs on its own `#[tokio::main(flavor = "current_thread")]` runtime that
     // is dropped the moment io_loop returns, so a close spawned or awaited there can be killed
     // before (or worse, after) `close()` latches `is_closed`. Pin the production sequence over
+    // `send` only queues into SCTP, and dropping the stream resets the channel at once: a peer
+    // that has not read a parting message by then throws it away, acknowledged or not. Lingering
+    // until the peer closes (as it does on that message) gets it read even by a peer busy for a
+    // while.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_linger_lets_a_parting_message_reach_a_busy_peer() {
+        let (offerer, mut answerer) = connect_loopback().await;
+        let parting = vec![7u8; 200 * 1024];
+        let len = parting.len();
+        let peer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let got = timeout(Duration::from_secs(10), answerer.next()).await;
+            answerer.close().await;
+            got
+        });
+        let mut stream = crate::Stream::WebRTC(offerer);
+        stream.send_raw(parting).await.unwrap();
+        let started = std::time::Instant::now();
+        stream.linger(Duration::from_secs(5)).await;
+        let lingered = started.elapsed();
+        drop(stream);
+
+        match peer.await.unwrap() {
+            Ok(Some(Ok(b))) => assert_eq!(b.len(), len),
+            Ok(_) => panic!("the parting message was lost to the close"),
+            Err(_) => panic!("peer never received anything"),
+        }
+        assert!(
+            lingered < Duration::from_secs(4),
+            "linger did not end when the peer closed: {:?}",
+            lingered
+        );
+    }
+
+    // Answering a close, the peer lingers for this side to close: `flush` must end once all is
+    // acknowledged, not wait for the peer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_flush_ends_once_all_is_acknowledged() {
+        let (offerer, mut answerer) = connect_loopback().await;
+        let parting = vec![7u8; 200 * 1024];
+        let len = parting.len();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let peer = tokio::spawn(async move {
+            let got = timeout(Duration::from_secs(10), answerer.next()).await;
+            let _ = done_rx.await;
+            answerer.close().await;
+            got
+        });
+        let mut stream = crate::Stream::WebRTC(offerer.clone());
+        stream.send_raw(parting).await.unwrap();
+        let started = std::time::Instant::now();
+        stream.flush(Duration::from_secs(5)).await;
+        let flushed = started.elapsed();
+        let left = offerer
+            .detached
+            .lock()
+            .await
+            .as_ref()
+            .map_or(0, |dc| dc.buffered_amount());
+        let _ = done_tx.send(());
+        drop(stream);
+        match peer.await.unwrap() {
+            Ok(Some(Ok(b))) => assert_eq!(b.len(), len),
+            other => panic!("the peer did not get the message: {:?}", other.map(|o| o.is_some())),
+        }
+        assert!(
+            flushed < Duration::from_secs(2),
+            "flush waited for the peer: {:?}",
+            flushed
+        );
+        assert_eq!(left, 0, "flush ended with {} bytes not acknowledged", left);
+    }
+
+    // A peer that closed first stops acknowledging, so what is still queued here stays counted
+    // forever: `flush` must end on the close, not wait out its bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_flush_ends_when_the_peer_closed() {
+        let (offerer, answerer) = connect_loopback().await;
+        // More than the peer's receive window: it does not read, so the rest stays queued here.
+        let mut sender = offerer.clone();
+        let send = tokio::spawn(async move { sender.send_raw(vec![7u8; 4 << 20]).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        answerer.close().await;
+        drop(answerer);
+        let mut stream = crate::Stream::WebRTC(offerer);
+        let started = std::time::Instant::now();
+        stream.flush(Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "flush waited out its bound: {:?}",
+            started.elapsed()
+        );
+        drop(stream);
+        let _ = timeout(Duration::from_secs(25), send).await;
+    }
+
+    // Neither waits past its bound for a peer that does not close.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_linger_keeps_to_its_bound() {
+        let (offerer, mut answerer) = connect_loopback().await;
+        let mut stream = crate::Stream::WebRTC(offerer);
+        stream.send_raw(vec![7u8; 1024]).await.unwrap();
+        let started = std::time::Instant::now();
+        stream.linger(Duration::from_millis(700)).await;
+        let lingered = started.elapsed();
+        assert!(
+            lingered >= Duration::from_millis(650) && lingered < Duration::from_millis(1500),
+            "linger took {:?}",
+            lingered
+        );
+        // The peer read it all the same, and sees the close after.
+        assert!(matches!(
+            timeout(Duration::from_secs(5), answerer.next()).await,
+            Ok(Some(Ok(_)))
+        ));
+        drop(stream);
+        answerer.close().await;
+    }
+
+    // A peer that keeps talking and never closes does not hold `linger` past its bound either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_linger_keeps_to_its_bound_while_the_peer_talks() {
+        let (offerer, answerer) = connect_loopback().await;
+        let talking = tokio::spawn(async move {
+            let mut answerer = answerer;
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < until {
+                if answerer.send_raw(vec![7u8; 16 * 1024]).await.is_err() {
+                    break;
+                }
+            }
+            answerer.close().await;
+        });
+        // Something is waiting to be read when the lingering starts.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut stream = crate::Stream::WebRTC(offerer);
+        stream.send_raw(vec![7u8; 1024]).await.unwrap();
+        let started = std::time::Instant::now();
+        stream.linger(Duration::from_millis(700)).await;
+        let lingered = started.elapsed();
+        drop(stream);
+        assert!(
+            lingered < Duration::from_millis(1500),
+            "linger was held past its bound: {:?}",
+            lingered
+        );
+        let _ = timeout(Duration::from_secs(10), talking).await;
+    }
+
     // `Stream::WebRTC`: `close_webrtc()` from a thread with no runtime at all, then Drop; the
     // peer must still see EOF — the closer thread, not any caller runtime, delivers it.
     #[tokio::test(flavor = "multi_thread")]

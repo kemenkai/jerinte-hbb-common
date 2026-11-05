@@ -106,6 +106,73 @@ lazy_static::lazy_static! {
         ]);
 }
 
+lazy_static::lazy_static! {
+    // The entry of `server-entries` in use. The service picks it; the UI takes up the service's
+    // pick. While none is picked, the single server options apply as they always did.
+    static ref SERVER_ENTRY: RwLock<Option<ServerEntry>> = Default::default();
+}
+
+// Taken by tests that set the entry in use, or that depend on what it decides: it is global.
+#[cfg(test)]
+pub(crate) static SERVER_ENTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// One way to the same servers, such as the intranet's native ports or the public WebSocket
+/// entry. Every entry leads to the same servers, so they share the key.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerEntry {
+    #[serde(default)]
+    pub name: String,
+    /// The ID server: `host:port` for the native ports, or a `ws://`/`wss://` URL.
+    #[serde(default)]
+    pub id: String,
+    /// The relay, written as the ID server itself hands it out: the ID server rewrites only
+    /// relays it recognizes for a peer that came in another way.
+    #[serde(default)]
+    pub relay: String,
+}
+
+impl ServerEntry {
+    /// Reached over WebSocket rather than the native ports.
+    pub fn is_ws(&self) -> bool {
+        crate::websocket::is_ws_endpoint(&self.id)
+    }
+}
+
+/// The usable entries of a `server-entries` value, in order of preference. An entry needs an ID
+/// server, and a relay too when it is reached over WebSocket, or the relay would be taken to be
+/// on the ID server's address. A value that is not a list of entries gives none.
+pub fn parse_server_entries(value: &str) -> Vec<ServerEntry> {
+    let Ok(entries) = serde_json::from_str::<Vec<ServerEntry>>(value) else {
+        return vec![];
+    };
+    entries
+        .into_iter()
+        .map(|e| ServerEntry {
+            name: e.name.trim().to_owned(),
+            id: e.id.trim().to_owned(),
+            relay: e.relay.trim().to_owned(),
+        })
+        .filter(|e| !e.id.is_empty() && !(e.is_ws() && e.relay.is_empty()))
+        .collect()
+}
+
+/// The ID servers of all `entries`, unless a server named in the executable's name comes before
+/// them, as it does when registering.
+fn entry_id_servers(entries: Vec<ServerEntry>, exe_server: &str) -> Option<Vec<String>> {
+    if !exe_server.is_empty() || entries.is_empty() {
+        return None;
+    }
+    Some(entries.into_iter().map(|e| e.id).collect())
+}
+
+/// The entry whose ID server is `id`, a missing port taken as the default on both sides.
+fn server_entry_with_id(entries: Vec<ServerEntry>, id: &str) -> Option<ServerEntry> {
+    let id = crate::socket_client::check_port(id, RENDEZVOUS_PORT);
+    entries
+        .into_iter()
+        .find(|e| crate::socket_client::check_port(&e.id, RENDEZVOUS_PORT) == id)
+}
+
 const NUM_CHARS: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
 const CHARS: &[char] = &[
@@ -1046,8 +1113,34 @@ impl Config {
         }
     }
 
+    /// The usable entries of `server-entries`, in order of preference.
+    pub fn get_server_entries() -> Vec<ServerEntry> {
+        parse_server_entries(&Self::get_option(keys::OPTION_SERVER_ENTRIES))
+    }
+
+    /// The entry in use, once one is picked. It comes before the single server options, even
+    /// ones the build overrides, since those only name one way to the same servers.
+    pub fn get_server_entry() -> Option<ServerEntry> {
+        SERVER_ENTRY.read().unwrap().clone()
+    }
+
+    pub fn set_server_entry(entry: Option<ServerEntry>) {
+        *SERVER_ENTRY.write().unwrap() = entry;
+    }
+
+    /// Takes up the service's pick, known by the ID server the service reports: the entry with
+    /// that ID server, or none when no entry has it.
+    pub fn follow_server_entry(id: &str) {
+        Self::set_server_entry(server_entry_with_id(Self::get_server_entries(), id));
+    }
+
     pub fn get_rendezvous_server() -> String {
         let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+        if rendezvous_server.is_empty() {
+            if let Some(entry) = Self::get_server_entry() {
+                rendezvous_server = entry.id;
+            }
+        }
         if rendezvous_server.is_empty() {
             rendezvous_server = Self::get_option("custom-rendezvous-server");
         }
@@ -1074,6 +1167,11 @@ impl Config {
         if !s.is_empty() {
             return vec![s];
         }
+        // One entry at a time: the same device registered through two of them would have the
+        // ID server move it between the two.
+        if let Some(entry) = Self::get_server_entry() {
+            return vec![entry.id];
+        }
         let s = Self::get_option("custom-rendezvous-server");
         if !s.is_empty() {
             return vec![s];
@@ -1094,6 +1192,14 @@ impl Config {
             }
         }
         return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect();
+    }
+
+    /// The ID servers peers are looked up on, one name for them whichever entry is in use: every
+    /// entry of `server-entries` leads to the same servers. Trusted-device credentials are kept
+    /// under it, so going between the intranet's entry and the public one keeps them.
+    pub fn get_id_servers() -> Vec<String> {
+        entry_id_servers(Self::get_server_entries(), &EXE_RENDEZVOUS_SERVER.read().unwrap())
+            .unwrap_or_else(Self::get_rendezvous_servers)
     }
 
     pub fn reset_online() {
@@ -2936,6 +3042,10 @@ pub fn option2bool(option: &str, value: &str) -> bool {
 }
 
 pub fn use_ws() -> bool {
+    // An entry in use says it by its ID server; the option is about the single server.
+    if let Some(entry) = Config::get_server_entry() {
+        return entry.is_ws();
+    }
     let option = keys::OPTION_ALLOW_WEBSOCKET;
     option2bool(option, &Config::get_option(option))
 }
@@ -2971,6 +3081,9 @@ pub mod keys {
     pub const OPTION_TRACKPAD_SPEED: &str = "trackpad-speed";
     pub const OPTION_REGISTER_DEVICE: &str = "register-device";
     pub const OPTION_RELAY_SERVER: &str = "relay-server";
+    // A JSON list of `ServerEntry`: several ways to the same servers, the first that answers
+    // preferred.
+    pub const OPTION_SERVER_ENTRIES: &str = "server-entries";
     pub const OPTION_ICE_SERVERS: &str = "ice-servers";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
     pub const OPTION_ALLOW_WEBRTC_CC: &str = "allow-webrtc-congestion-control";
@@ -3775,5 +3888,69 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+
+    const ENTRIES: &str = r#"[
+        {"name": "lan", "id": " 192.168.1.10:21116 ", "relay": "192.168.1.10:21117"},
+        {"name": "no relay", "id": "wss://example.com:4443/id"},
+        {"name": "no id", "relay": "192.168.1.10:21117"},
+        {"name": "wan", "id": "wss://example.com:4443/id", "relay": "wss://example.com:4443/relay"}
+    ]"#;
+
+    #[test]
+    fn a_server_entry_needs_an_id_server_and_over_websocket_a_relay() {
+        let entries = parse_server_entries(ENTRIES);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["lan", "wan"]);
+        assert_eq!(entries[0].id, "192.168.1.10:21116");
+        assert!(!entries[0].is_ws());
+        assert!(entries[1].is_ws());
+        // The native ports may leave the relay to the ID server.
+        assert_eq!(parse_server_entries(r#"[{"id": "10.0.0.1:21116"}]"#).len(), 1);
+        for value in ["", "[]", "{}", "not json", r#"{"id": "10.0.0.1:21116"}"#] {
+            assert!(parse_server_entries(value).is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_service_pick_is_known_by_its_id_server() {
+        let entries = parse_server_entries(ENTRIES);
+        let name = |id: &str| server_entry_with_id(entries.clone(), id).map(|e| e.name);
+        assert_eq!(name("192.168.1.10:21116").as_deref(), Some("lan"));
+        assert_eq!(name("wss://example.com:4443/id").as_deref(), Some("wan"));
+        assert_eq!(name("192.168.1.10:21118"), None);
+        assert_eq!(name(""), None);
+        let defaulted = parse_server_entries(r#"[{"name": "lan", "id": "192.168.1.10"}]"#);
+        assert_eq!(
+            server_entry_with_id(defaulted, "192.168.1.10:21116").map(|e| e.name),
+            Some("lan".to_owned())
+        );
+    }
+
+    #[test]
+    fn every_entry_is_one_name_for_the_same_servers() {
+        let entries = parse_server_entries(ENTRIES);
+        let ids = ["192.168.1.10:21116", "wss://example.com:4443/id"].map(String::from);
+        assert_eq!(entry_id_servers(entries.clone(), ""), Some(ids.to_vec()));
+        // A server in the executable's name comes before the entries, as when registering.
+        assert_eq!(entry_id_servers(entries, "rs.example.com"), None);
+        assert_eq!(entry_id_servers(vec![], ""), None);
+    }
+
+    #[test]
+    fn the_entry_in_use_comes_before_the_single_server_and_says_the_transport() {
+        let _entry = SERVER_ENTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = Config::get_server_entry();
+        let entries = parse_server_entries(ENTRIES);
+        let (lan, wan) = (entries[0].clone(), entries[1].clone());
+        Config::set_server_entry(Some(lan.clone()));
+        assert_eq!(Config::get_rendezvous_server(), lan.id);
+        assert_eq!(Config::get_rendezvous_servers(), vec![lan.id.clone()]);
+        assert!(!use_ws());
+        Config::set_server_entry(Some(wan.clone()));
+        assert_eq!(Config::get_rendezvous_server(), wan.id);
+        assert_eq!(Config::get_rendezvous_servers(), vec![wan.id.clone()]);
+        assert!(use_ws());
+        Config::set_server_entry(saved);
     }
 }

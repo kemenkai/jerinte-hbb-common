@@ -125,6 +125,37 @@ impl Stream {
         }
     }
 
+    /// Before the stream is dropped, on WebRTC, where sending only queues and dropping throws
+    /// the queue away: waits, `within` at most, until everything sent is acknowledged or the peer
+    /// closed (`WebRTCStream::flush`). For the side answering a close; the side closing
+    /// `linger`s. Other transports return at once: TCP and WebSocket leave what is sent to the
+    /// kernel, which sends it after a close too. What comes in meanwhile is dropped.
+    pub async fn flush(&mut self, within: std::time::Duration) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.flush(within).await,
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = within;
+            }
+        }
+    }
+
+    /// Before the stream is dropped, having sent a parting message (a close reason, a login
+    /// error), on WebRTC: waits, `within` at most, for the peer to close, the one sign it read the
+    /// message (`WebRTCStream::linger`). Other transports return at once, as for `flush`. What
+    /// comes in meanwhile is dropped.
+    pub async fn linger(&mut self, within: std::time::Duration) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.linger(within).await,
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = within;
+            }
+        }
+    }
+
     /// Whether ICE has stopped hearing from the peer on a WebRTC transport. Transient and
     /// recoverable — it says the peer is worth suspecting, never that the session is over — and
     /// always false for transports this change leaves alone.

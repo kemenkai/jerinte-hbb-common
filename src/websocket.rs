@@ -486,7 +486,9 @@ pub fn check_ws(endpoint: &str) -> String {
     };
 
     let custom_rendezvous_server = Config::get_rendezvous_server();
-    let relay_server = Config::get_option(OPTION_RELAY_SERVER);
+    let relay_server = Config::get_server_entry()
+        .map(|entry| entry.relay)
+        .unwrap_or_else(|| Config::get_option(OPTION_RELAY_SERVER));
     let rendezvous_port = split_host_port(&custom_rendezvous_server)
         .map(|(_, p)| p)
         .unwrap_or(RENDEZVOUS_PORT);
@@ -624,6 +626,9 @@ mod tests {
 
     #[test]
     fn test_check_ws() {
+        let _entry = crate::config::SERVER_ENTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let options = Config::get_options();
         // enable websocket
         Config::set_option(keys::OPTION_ALLOW_WEBSOCKET.to_string(), "Y".to_string());

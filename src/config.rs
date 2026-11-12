@@ -3084,6 +3084,8 @@ pub mod keys {
     // A JSON list of `ServerEntry`: several ways to the same servers, the first that answers
     // preferred.
     pub const OPTION_SERVER_ENTRIES: &str = "server-entries";
+    // `name=address` pairs: what to resolve a name to when the system cannot (`dns_fallback`).
+    pub const OPTION_DNS_FALLBACK: &str = "dns-fallback";
     pub const OPTION_ICE_SERVERS: &str = "ice-servers";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
     pub const OPTION_ALLOW_WEBRTC_CC: &str = "allow-webrtc-congestion-control";

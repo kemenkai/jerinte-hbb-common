@@ -4,6 +4,7 @@ use crate::{
         use_ws, Config, Socks5Server, EXE_RENDEZVOUS_SERVER, PROD_RENDEZVOUS_SERVER, RELAY_PORT,
         RENDEZVOUS_PORT,
     },
+    dns_fallback::Fallback,
     protobuf::Message,
     socket_client::split_host_port,
     sodiumoxide::crypto::secretbox::Key,
@@ -39,6 +40,32 @@ use tungstenite::client::IntoClientRequest;
 /// transport back exactly where it started rather than above it.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
+
+/// The host and port a WebSocket URL is dialled at.
+fn host_port(uri: &tungstenite::http::Uri) -> io::Result<(String, u16)> {
+    let host = uri
+        .host()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Invalid WebSocket URL: no host"))?;
+    let port = uri
+        .port_u16()
+        .or_else(|| match uri.scheme_str() {
+            Some("wss") => Some(443),
+            Some("ws") => Some(80),
+            _ => None,
+        })
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Invalid WebSocket URL scheme"))?;
+    Ok((host.to_owned(), port))
+}
+
+/// `dns-fallback`, if it covers `host` and may be used for `url`: only over TLS with the
+/// certificate checked, so that the address it gives has to prove it serves the name.
+fn dns_fallback(url: &str, host: &str, danger_accept_invalid_cert: bool) -> Option<Fallback> {
+    if !url.starts_with("wss://") || danger_accept_invalid_cert {
+        return None;
+    }
+    let fallback = Fallback::from_config();
+    fallback.covers(host).then_some(fallback)
+}
 
 // macOS/iOS Native TLS may wait for a response without flushing the proxy tunnel's write buffer.
 struct FlushBeforeRead(DynTcpStream);
@@ -158,21 +185,8 @@ impl WsFramedStream {
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
         let connector =
             Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false))?;
+        let (host, port) = host_port(request.uri())?;
         let result = if let Some(proxy_conf) = proxy_conf {
-            let host = request.uri().host().ok_or_else(|| {
-                Error::new(ErrorKind::InvalidInput, "Invalid WebSocket URL: no host")
-            })?;
-            let port = request
-                .uri()
-                .port_u16()
-                .or_else(|| match request.uri().scheme_str() {
-                    Some("wss") => Some(443),
-                    Some("ws") => Some(80),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    Error::new(ErrorKind::InvalidInput, "Invalid WebSocket URL scheme")
-                })?;
             let target = format!("{host}:{port}");
             timeout(Duration::from_millis(ms_timeout), async {
                 let stream = crate::tcp::FramedStream::connect(
@@ -200,6 +214,19 @@ impl WsFramedStream {
             })
             .await??
             .map(Either::Right)
+        } else if let Some(fallback) =
+            dns_fallback(url, &host, danger_accept_invalid_cert.unwrap_or(false))
+        {
+            // The system may not resolve this name: dial what `dns-fallback` makes of it. The
+            // handshake still goes by the name in the URL.
+            timeout(Duration::from_millis(ms_timeout), async {
+                let stream = fallback.connect(&host, port).await?;
+                Ok::<_, anyhow::Error>(
+                    client_async_tls_with_config(request, stream, ws_config, connector).await,
+                )
+            })
+            .await??
+            .map(|(stream, _)| Either::Left(stream))
         } else {
             let disable_nagle = false;
             timeout(

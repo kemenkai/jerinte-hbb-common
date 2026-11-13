@@ -72,6 +72,16 @@ impl Fallback {
         self.0.contains_key(&normalize(host))
     }
 
+    /// Whether the system failed to resolve covered `host` when last asked, within `FAILED_FOR`:
+    /// what a lookup would fall back for right now, without making one. Other programs on this
+    /// machine, a browser say, cannot resolve it either then.
+    pub fn unresolved(&self, host: &str) -> bool {
+        let name = normalize(host);
+        let verdict = VERDICTS.lock().unwrap().get(&name).copied();
+        self.0.contains_key(&name)
+            && matches!(verdict, Some((false, at)) if at.elapsed() < FAILED_FOR)
+    }
+
     /// `host`'s addresses as the system resolves it. For a covered name, the fallback instead when
     /// the system fails within `LOOKUP_TIMEOUT` or has failed in the last `FAILED_FOR`. Port 0 is
     /// fine for callers that set the port themselves.
@@ -191,10 +201,16 @@ mod tests {
             asked.fetch_add(1, SeqCst);
             async { Err(io::Error::other("no DNS")) }
         };
+        let fallback = Fallback::parse("fails.test=10.0.0.5, other.test=10.0.0.6");
+        assert!(!fallback.unresolved(name));
         assert_eq!(
             lookup_with(name, &ips, 4443, failing).await,
             [addr("10.0.0.5:4443")]
         );
+        // Known unresolved now: this name alone, and only as one the option covers.
+        assert!(fallback.unresolved("Fails.Test."));
+        assert!(!fallback.unresolved("other.test"));
+        assert!(!Fallback::parse("").unresolved(name));
         // Within FAILED_FOR the system is not asked again.
         tokio::time::advance(FAILED_FOR - Duration::from_secs(1)).await;
         assert_eq!(
@@ -211,6 +227,7 @@ mod tests {
             VERDICTS.lock().unwrap().get(name),
             Some((true, _))
         ));
+        assert!(!fallback.unresolved(name));
     }
 
     #[tokio::test(start_paused = true)]

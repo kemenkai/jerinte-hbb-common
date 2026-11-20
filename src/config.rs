@@ -2523,13 +2523,14 @@ impl DiscoveryPeer {
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct LanPeers {
-    #[serde(default, deserialize_with = "deserialize_vec_discoverypeer")]
-    pub peers: Vec<DiscoveryPeer>,
     /// The `server_mark` of the server the peers were found on. Written with the peers, so a
     /// list found on another server, or rewritten by a build that does not keep this field,
-    /// reads as empty rather than as clients on ours.
+    /// reads as empty rather than as clients on ours. Before `peers`: TOML 0.5, which confy
+    /// writes with, refuses a plain value after an array of tables.
     #[serde(default, deserialize_with = "deserialize_string")]
     pub server: String,
+    #[serde(default, deserialize_with = "deserialize_vec_discoverypeer")]
+    pub peers: Vec<DiscoveryPeer>,
 }
 
 impl LanPeers {
@@ -3221,6 +3222,12 @@ mod tests {
         assert!(LanPeers::found_on(old.clone(), &ours).peers.is_empty());
         // Without a key of our own, a list without the field is everyone's, as upstream has it.
         assert_eq!(LanPeers::found_on(old, "").peers.len(), 1);
+        // Written as `store` writes it (confy, TOML 0.5) and read back, peers and all.
+        let path = std::env::temp_dir().join(format!("lan-peers-test-{}.toml", std::process::id()));
+        store_path(path.clone(), found(&ours)).unwrap();
+        let read: LanPeers = confy::load_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((read.server.as_str(), read.peers.len()), (ours.as_str(), 1));
     }
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 

@@ -636,7 +636,10 @@ impl Config2 {
     pub fn get_trusted_device_stores() -> crate::ResultType<(String, String)> {
         let _lock = CONFIG2.read().unwrap();
         let config: Self = try_load_path(Self::file())?;
-        Ok((config.trusted_devices_v2()?.to_owned(), config.trusted_devices))
+        Ok((
+            config.trusted_devices_v2()?.to_owned(),
+            config.trusted_devices,
+        ))
     }
 
     pub fn has_trusted_devices_v2() -> crate::ResultType<bool> {
@@ -1198,8 +1201,11 @@ impl Config {
     /// entry of `server-entries` leads to the same servers. Trusted-device credentials are kept
     /// under it, so going between the intranet's entry and the public one keeps them.
     pub fn get_id_servers() -> Vec<String> {
-        entry_id_servers(Self::get_server_entries(), &EXE_RENDEZVOUS_SERVER.read().unwrap())
-            .unwrap_or_else(Self::get_rendezvous_servers)
+        entry_id_servers(
+            Self::get_server_entries(),
+            &EXE_RENDEZVOUS_SERVER.read().unwrap(),
+        )
+        .unwrap_or_else(Self::get_rendezvous_servers)
     }
 
     pub fn reset_online() {
@@ -2519,23 +2525,61 @@ impl DiscoveryPeer {
 pub struct LanPeers {
     #[serde(default, deserialize_with = "deserialize_vec_discoverypeer")]
     pub peers: Vec<DiscoveryPeer>,
+    /// The `server_mark` of the server the peers were found on. Written with the peers, so a
+    /// list found on another server, or rewritten by a build that does not keep this field,
+    /// reads as empty rather than as clients on ours.
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub server: String,
 }
 
 impl LanPeers {
+    /// Which ID server this client is on, as LAN discovery messages carry it (`misc`): the start
+    /// of a hash of the server's key. Clients answer and list only those on their own server: one
+    /// on another server cannot be connected to through ours, and has no business learning this
+    /// machine's ID, host and user name. Empty without a key, when discovery is everyone's, as
+    /// upstream has it.
+    pub fn server_mark() -> String {
+        Self::server_mark_of(&Config::get_option("key"))
+    }
+
+    pub fn server_mark_of(key: &str) -> String {
+        if key.is_empty() {
+            return String::new();
+        }
+        let hash =
+            sodiumoxide::crypto::hash::sha256::hash(format!("lan-discovery:{key}").as_bytes());
+        hash.0[..8].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The stored peers, if they were found on the server this client is on now; none otherwise.
     pub fn load() -> LanPeers {
         let _lock = CONFIG.read().unwrap();
-        match confy::load_path(Config::file_("_lan_peers")) {
+        let stored = match confy::load_path(Config::file_("_lan_peers")) {
             Ok(peers) => peers,
             Err(err) => {
                 log::error!("Failed to load lan peers: {}", err);
                 Default::default()
             }
+        };
+        Self::found_on(stored, &Self::server_mark())
+    }
+
+    fn found_on(stored: LanPeers, server: &str) -> LanPeers {
+        if stored.server == server {
+            stored
+        } else {
+            LanPeers {
+                peers: Vec::new(),
+                server: server.to_owned(),
+            }
         }
     }
 
+    /// Stores `peers` as found on the server this client is on now.
     pub fn store(peers: &[DiscoveryPeer]) {
         let f = LanPeers {
             peers: peers.to_owned(),
+            server: Self::server_mark(),
         };
         if let Err(err) = store_path(Config::file_("_lan_peers"), f) {
             log::error!("Failed to store lan peers: {}", err);
@@ -3152,6 +3196,32 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn lan_peers_count_only_on_the_server_they_were_found_on() {
+        let ours = LanPeers::server_mark_of("key of our server");
+        assert_eq!(ours.len(), 16);
+        assert!(ours.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(ours, LanPeers::server_mark_of("key of another server"));
+        assert_eq!(LanPeers::server_mark_of(""), "");
+        let peer = DiscoveryPeer {
+            id: "123456789".to_owned(),
+            ..Default::default()
+        };
+        let found = |server: &str| LanPeers {
+            peers: vec![peer.clone()],
+            server: server.to_owned(),
+        };
+        assert_eq!(LanPeers::found_on(found(&ours), &ours).peers.len(), 1);
+        // Found on another server, or written without the field (an older build): none.
+        let other = LanPeers::server_mark_of("key of another server");
+        assert!(LanPeers::found_on(found(&other), &ours).peers.is_empty());
+        let old: LanPeers = toml::from_str("[[peers]]\nid = '123456789'\n").unwrap();
+        assert_eq!(old.server, "");
+        assert!(LanPeers::found_on(old.clone(), &ours).peers.is_empty());
+        // Without a key of our own, a list without the field is everyone's, as upstream has it.
+        assert_eq!(LanPeers::found_on(old, "").peers.len(), 1);
+    }
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -3908,7 +3978,10 @@ mod tests {
         assert!(!entries[0].is_ws());
         assert!(entries[1].is_ws());
         // The native ports may leave the relay to the ID server.
-        assert_eq!(parse_server_entries(r#"[{"id": "10.0.0.1:21116"}]"#).len(), 1);
+        assert_eq!(
+            parse_server_entries(r#"[{"id": "10.0.0.1:21116"}]"#).len(),
+            1
+        );
         for value in ["", "[]", "{}", "not json", r#"{"id": "10.0.0.1:21116"}"#] {
             assert!(parse_server_entries(value).is_empty(), "{value}");
         }
@@ -3941,7 +4014,9 @@ mod tests {
 
     #[test]
     fn the_entry_in_use_comes_before_the_single_server_and_says_the_transport() {
-        let _entry = SERVER_ENTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _entry = SERVER_ENTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved = Config::get_server_entry();
         let entries = parse_server_entries(ENTRIES);
         let (lan, wan) = (entries[0].clone(), entries[1].clone());
